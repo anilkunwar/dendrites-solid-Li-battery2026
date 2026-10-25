@@ -1,6 +1,6 @@
 # Electrochemistry Coupled Phase Field  FFT Solver (Allen-Cahn, Cahn-Hilliard, Mechanics and Electrochemistry) in Lithium-ion Solid State Battery
 
-## r1  J2 Plasticity 
+## r1 : J2 Plasticity 
 
 J2 plasticity is unsuitable for polymers because it ignores pressure-dependence, volume changes, and viscoelasticity.
 However, in the context of this specific spectral phase-field code, J2 is used as a computational necessity. It provides a mathematically elegant, computationally cheap way to regularize infinite stress singularities at the dendrite tip and acts as a phenomenological proxy for local polymer creep/stress-relaxation, allowing the FFT solver to run efficiently while still capturing the primary physics of dendrite propagation along grain boundaries.
