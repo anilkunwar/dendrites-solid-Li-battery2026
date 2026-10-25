@@ -11,4 +11,4 @@ J2 (von Mises) Flow Rule : J2 perfectly captures metal dislocation glide and cre
 
 ## r1: a single set of VAR for the entire grains within the two  phase states (electrode and electrolyte). the MPF order parameters are represented by the name "ETA"
 
-[![continuummodelnt2d](https://img.shields.io/badge/onevar1-streamlit-blue)](https://lithium-dendrites-in-solid-state-battery4.streamlit.app/) ( J2 flow rule or J2 plasticity for both Li metal and polymers,  All grains within electrode or electrolyte  are represented by a MPF order parameters, Temperature slider to model realistic temperature conditions, )
+[![continuummodelnt2d](https://img.shields.io/badge/onevar1-streamlit-blue)](https://lithium-dendrites-in-solid-state-battery1.streamlit.app/) ( J2 flow rule or J2 plasticity for both Li metal and polymers,  All grains within electrode or electrolyte  are represented by a MPF order parameters, Temperature slider to model realistic temperature conditions, )
