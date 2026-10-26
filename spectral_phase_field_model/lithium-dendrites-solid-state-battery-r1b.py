@@ -307,6 +307,7 @@ class ColormapRegistry:
 FIELD_DEFAULT_CMAPS = {
     'eta':         'li_conc',
     'c_li':       'plasma',
+    'c_salt':     'cividis',
     'c_e':        'YlOrBr',
     'phi_g':      'gray',
     'grain_map':  'grain_map',
@@ -320,11 +321,13 @@ FIELD_DEFAULT_CMAPS = {
     'sigma_y':    'viridis',
     'rho_gnd':    'inferno',
     'phi_flux':   'autumn',
+    'sei_damage': 'inferno',
 }
 
 FIELD_LABELS = {
     'eta':         'eta (Li metal order parameter)',
     'c_li':       'c_Li+ (Li+ ion concentration)',
+    'c_salt':     'c_salt (LiTFSI salt concentration)',
     'c_e':        'c_e- (electron concentration)',
     'phi_g':      'phi_g (SE grain indicator)',
     'grain_map':  'Grain ID map (Voronoi)',
@@ -338,25 +341,28 @@ FIELD_LABELS = {
     'sigma_y':    'sigma_y (yield stress, MPa)',
     'rho_gnd':    'rho_GND (GND density)',
     'phi_flux':   '|J_Li+| (Li+ flux magnitude)',
+    'sei_damage': 'SEI damage (0=intact, 1=fractured)',
 }
 
 FIELD_UNITS = {
-    'eta': '', 'c_li': '', 'c_e': '', 'phi_g': '', 'grain_map': '',
-    'phi_gb': '', 'phi_pot': 'V', 'D_eff': 'm^2/s',
+    'eta': '', 'c_li': '', 'c_salt': '', 'c_e': '', 'phi_g': '',
+    'grain_map': '', 'phi_gb': '', 'phi_pot': 'V', 'D_eff': 'm^2/s',
     'sigma_eq': 'GPa', 'sigma_h': 'GPa', 'h': 'um',
     'eps_p_mag': '', 'sigma_y': 'MPa', 'rho_gnd': '',
-    'phi_flux': '',
+    'phi_flux': '', 'sei_damage': '',
 }
 
 FIELD_DEFAULT_RNG = {
     'eta':         (0.0, 1.0),
     'c_li':       (0.0, 1.0),
+    'c_salt':     (0.0, 1.0),
     'c_e':        (0.0, 1.0),
     'phi_g':      (0.0, 1.0),
     'phi_gb':     (0.0, 1.0),
     'phi_pot':    (-0.25, 0.05),
     'rho_gnd':    (0.0, 1.0),
     'h':          (0.0, 50.0),
+    'sei_damage': (0.0, 1.0),
 }
 
 DISCRETE_FIELDS = {'grain_map'}
@@ -391,11 +397,16 @@ class MaterialProperties:
     # ====================================================================
     # LITHIUM METAL + LITHIUM-POLYMER ELECTROLYTES
     # --------------------------------------------------------------------
-    # Li metal self-diffusion at room temperature (~1e-15 m^2/s) is
-    # roughly 2-3 orders of magnitude SLOWER than Na (~1e-12 m^2/s).
-    # This slower self-diffusion is what makes Li dendrites propagate
-    # via a root-growth / whisker mode, whereas Na's fast surface
-    # diffusion favours a surface-growth / particle mode.  Misfit
+    # Li metal self-diffusion at room T (~1e-12 to 1e-14 m^2/s) is
+    # actually FASTER than Na's (~1e-16 m^2/s).  The fast Li self-
+    # diffusion tends to flatten the Li/electrolyte interface, so Li
+    # dendrites are NOT caused by slow self-diffusion.  They are
+    # caused by (a) low transference number t+ (~0.2-0.4 in PEO/LiTFSI)
+    # which causes concentration polarization at the plating front,
+    # and (b) the mechanically robust SEI on Li that cracks under
+    # deposition pressure, forcing Li to extrude from the root in a
+    # whisker / root-growth mode (rather than Na's particle mode
+    # enabled by its weak SEI and fast surface diffusion).  Misfit
     # strains are smaller for Li because Li+ is smaller than Na+.
     # Polymer electrolytes differ widely in stiffness, GB dependence,
     # and ionic conductivity:
@@ -408,11 +419,19 @@ class MaterialProperties:
         # --- LITHIUM METAL ---
     LI_METAL = {
         'name': 'Li',
-        'D_Li': 1.0e-15,            # m^2/s (Li self-diffusion at room T; ~2-3
-                          #  orders of magnitude SLOWER than Na, which
-                          #  is the physical reason Li dendrites grow
-                          #  via root-growth / whisker mode rather than
-                          #  Na's surface-growth / particle mode)
+        'D_Li': 1.0e-13,            # m^2/s.  Realistic Li metal self-diffusion
+                          # at room T is in the range ~1e-12 to 1e-14,
+                          # which is FASTER than Na's ~1e-16 m^2/s (not
+                          # slower, as a previous comment claimed).  The
+                          # fast self-diffusion tends to flatten the
+                          # interface, so Li dendrites are NOT produced
+                          # by fudging this value; they are produced by
+                          # (a) low transference number t+ which causes
+                          # concentration polarization, and (b) the SEI
+                          # mechanical layer cracking under stress,
+                          # which forces Li to extrude from the root.
+                          # See the SEI damage field and the t+ scaling
+                          # in _evolve_c_li() for the actual physics.
         'sigma_Li': 1.1e7,          # S/m (electronic conductivity)
         'c0': 7.69e4,               # mol/m^3 (density 534 kg/m3 / 0.00694 kg/mol)
         'elastic': {'C11': 7.86e9, 'C12': 4.24e9, 'C44': 1.81e9,
@@ -572,7 +591,7 @@ def default_figure_customization():
         'vector_width':         11.0,
         'vector_height':         5.5,
         'diagnostics_width':    13.0,
-        'diagnostics_height':    8.0,
+        'diagnostics_height':   11.0,
         'line_profile_width':   11.0,
         'line_profile_height':   4.5,
         'line_width':            2.0,
@@ -1331,7 +1350,17 @@ class LiSSBSolver:
             base['sigma_SE'] = float(params.get('custom_sigma_SE', 1.0e-4))
             self.mat_se = base
         else:
-            self.mat_se = MaterialProperties.get_se_li(se_name)
+            # Look up the named material, then let the user override the
+            # transport properties (D_SE, D_gb_ratio, sigma_SE) via the
+            # always-on UI sliders.  This makes PEO/PAN/PPC/PVDF tunable
+            # without picking 'custom'.
+            self.mat_se = MaterialProperties.get_se_li(se_name).copy()
+            if 'custom_D_bulk' in params:
+                self.mat_se['D_SE'] = float(params['custom_D_bulk'])
+            if 'custom_D_gb_ratio' in params:
+                self.mat_se['D_gb_ratio'] = float(params['custom_D_gb_ratio'])
+            if 'custom_sigma_SE' in params:
+                self.mat_se['sigma_SE'] = float(params['custom_sigma_SE'])
 
         # Wavenumber vectors
         self.kx, self.ky, self.k2 = make_k_vectors(
@@ -1373,8 +1402,8 @@ class LiSSBSolver:
         # Phase-field parameters
         self.L_eta = float(params.get('L_eta', 1.0e-6))    # interface mobility
         self.L_phi = float(params.get('L_phi', 5.0e-3))  # reaction prefactor (raised from 1e-3)
-        self.kappa = float(params.get('kappa', 1.0e-15))  # gradient energy
-        self.w_barrier = float(params.get('w_barrier', 1.0e6))  # barrier height
+        self.kappa = float(params.get('kappa', 2.0e-15))  # gradient energy (Li surface energy)
+        self.w_barrier = float(params.get('w_barrier', 2.0e6))  # barrier height (Li surface energy)
         self.alpha_bv = float(params.get('alpha_bv', 0.5))  # BV symmetry
         self.aniso_strength = float(params.get('aniso_strength', 0.0))
         self.Omega_stress = float(params.get('Omega_stress', 0.05))
@@ -1396,6 +1425,39 @@ class LiSSBSolver:
         # dynamic GB indicator is high (drives preferential GB propagation).
         #self.wetting_factor = float(params.get('wetting_factor', 1.0))
         self.wetting_factor = float(params.get('wetting_factor', 1.0))
+
+        # --- NEW PHYSICS: transference number, salt diffusion, SEI damage ---
+        # Transference number t+ of Li+ in the polymer electrolyte.
+        # PEO/LiTFSI: t+ ~ 0.2-0.4 (low — anions carry most of the
+        # current).  PAN/PPC/PVDF: t+ ~ 0.5-0.7.  Low t+ causes severe
+        # concentration polarization at the plating front, which is the
+        # primary driver of Li dendrite growth in real cells.  In the
+        # Nernst-Planck solver, the cation migration term is scaled by
+        # t+ (the cation only carries t+ of the ionic current).
+        self.transference_number = float(
+            params.get('transference_number', 0.30))
+
+        # SEI (solid-electrolyte interphase) mechanical damage.
+        # The SEI on Li is mechanically robust; under deposition pressure
+        # it accumulates damage until it cracks, at which point Li
+        # extrudes through the crack in a whisker / root-growth mode
+        # (the dominant Li dendrite morphology).  Damage accumulates
+        # when the local hydrostatic stress exceeds the SEI yield
+        # stress, and relaxes (heals) exponentially.
+        self.sei_yield_stress_Pa = float(
+            params.get('sei_yield_stress_MPa', 50.0)) * 1.0e6  # MPa -> Pa
+        self.sei_healing_rate = float(
+            params.get('sei_healing_rate', 1.0e-4))  # 1/s (slow)
+
+        # Salt (LiTFSI) concentration field c_salt: diffuses with its
+        # own D_salt.  Initially uniform = 1 (normalized), depleted near
+        # the plating front by Li+ consumption.
+        self.D_salt = float(self.mat_se.get('D_SE', 5.0e-13))
+        self.c_salt = np.ones((self.Ny, self.Nx), dtype=float)
+
+        # SEI damage field: 0 = intact SEI, 1 = fully fractured.
+        # Initialized to 0 everywhere (no pre-existing cracks).
+        self.sei_damage = np.zeros((self.Ny, self.Nx), dtype=float)
 
         # Applied voltage (single plating direction) — must be set before
         # _init_potential() is called.
@@ -1436,10 +1498,12 @@ class LiSSBSolver:
         self.history = {
             'time': [], 'eta_gb_mean': [], 'eta_bulk_mean': [],
             'c_li_gb_mean': [], 'c_li_bulk_mean': [],
+            'c_salt_gb_mean': [], 'c_salt_bulk_mean': [],
             'max_dendrite_depth_um': [], 'li_volume_frac': [],
             'phi_min': [], 'phi_max': [],
             'avg_stress_GPa': [], 'max_stress_GPa': [],
             'plastic_work': [], 'energy': [],
+            'avg_sei_damage': [], 'max_sei_damage': [],
         }
 
     # ------------------------------------------------------------------
@@ -1601,6 +1665,14 @@ class LiSSBSolver:
                            np.maximum(bv_rate, 0.0) *
                            nucleation_mask *
                            self.wetting_factor)
+        # --- SEI damage enhancement (root-growth / whisker mode) ---
+        # Where the SEI has cracked (sei_damage -> 1), the BV source is
+        # boosted by a factor (1 + sei_damage * sei_enhancement), so Li
+        # preferentially plates through the crack.  This is the
+        # physical mechanism that makes Li dendrites grow via root
+        # extrusion rather than Na's surface-particle mode.
+        sei_enhancement = 5.0  # max 5x BV at full damage
+        bv_interface = bv_interface * (1.0 + self.sei_damage * sei_enhancement)
         return bv_interface + nucleation_rate
 
     # ------------------------------------------------------------------
@@ -1703,13 +1775,21 @@ class LiSSBSolver:
 
     # ------------------------------------------------------------------
     def _evolve_c_li(self, deta_dt):
-        """Li+ reaction-diffusion step (Nernst-Planck).
+        """Li+ reaction-diffusion step (Nernst-Planck with transference number).
 
-        Eq. 8: d(c_li)/dt = nabla . [D_eff * (nabla c_li + (F/RT) * c_li * nabla phi)]
-                            - (c_Li/c0) * deta/dt
+        Eq. 8 (modified for transference number t+):
+            d(c_li)/dt = nabla . [D_eff * (nabla c_li + t+ * (F/RT) * c_li * nabla phi)]
+                                - (c_Li/c0) * deta/dt
+
+        The migration term is scaled by t+ (the cation carries only t+
+        of the ionic current).  With low t+ (e.g. 0.3 for PEO/LiTFSI),
+        the cation flux is mostly diffusive, and concentration
+        polarization builds up at the plating front — the primary
+        driver of Li dendrite growth in real cells.
         """
         D_eff = self.D_eff
         F_over_RT = F_FARADAY / (R_GAS * self.temperature_K)
+        t_plus = self.transference_number
 
         # Substep for stability (explicit diffusion)
         dx_min = min(self.dx, self.dy)
@@ -1724,25 +1804,90 @@ class LiSSBSolver:
             # Gradient of c_li and phi
             c_gx, c_gy = spectral_gradients(c_li_new, self.kx, self.ky)
             phi_gx, phi_gy = spectral_gradients(self.phi_pot, self.kx, self.ky)
-            # Nernst-Planck flux: J = -D_eff * (grad c + (F/RT) c grad phi)
+            # Nernst-Planck flux with transference number t+:
+            #   J = -D_eff * (grad c_li + t+ * (F/RT) * c_li * grad phi)
+            # The diffusion term is full D_eff; the migration term is
+            # scaled by t+ (cation carries only t+ of the ionic current).
             c_safe = np.clip(c_li_new, 0.0, 1.0)
-            Jx = -D_eff * (c_gx + F_over_RT * c_safe * phi_gx)
-            Jy = -D_eff * (c_gy + F_over_RT * c_safe * phi_gy)
+            Jx = -D_eff * (c_gx + t_plus * F_over_RT * c_safe * phi_gx)
+            Jy = -D_eff * (c_gy + t_plus * F_over_RT * c_safe * phi_gy)
             div_J = spectral_divergence(Jx, Jy, self.kx, self.ky)
             # Reaction source: -(c_Li/c0) * deta/dt (consumption of Li+ when eta grows)
-            # c_Li (total) is approximately c0 * eta + c_li * (1-eta) * c0
-            # The consumption rate scales with deta/dt
-            c_total_norm = c_safe  # use normalized c_li
+            c_total_norm = c_safe
             source = -c_total_norm * deta_dt
             c_li_new = c_li_new + dt_sub * (div_J + source)
             # Enforce BCs: c_li = 0 inside Li metal, c_li = 1 at right boundary
-            mask_li = self.geom_meta['mask_li']
             c_li_new = np.where(self.eta > 0.5, 0.0, c_li_new)
             # Right boundary: Dirichlet c_li = 1
             c_li_new[:, -1] = 1.0
             c_li_new = np.clip(c_li_new, 0.0, 1.0)
 
         return c_li_new
+
+    # ------------------------------------------------------------------
+    def _evolve_c_salt(self, deta_dt):
+        """Salt (LiTFSI) concentration step (diffusion only).
+
+        The salt concentration c_salt represents the local LiTFSI
+        molarity (normalized to 1 in the bulk).  It diffuses with D_salt
+        and is depleted at the plating front by the BV sink (Li+ is
+        consumed, so the salt is consumed too).  Visualizing c_salt
+        shows the salt-depletion zone near the dendrite, which is a
+        key signature of low-transference-number cells.
+
+            d(c_salt)/dt = nabla . (D_salt * nabla c_salt) - c_salt * deta/dt
+        """
+        D_salt = self.D_salt
+        dx_min = min(self.dx, self.dy)
+        D_max = max(D_salt, 1.0e-30)
+        dt_expl = 0.20 * dx_min * dx_min / D_max
+        n_sub = max(1, int(np.ceil(self.dt / dt_expl)))
+        dt_sub = self.dt / n_sub
+
+        c_salt_new = self.c_salt.copy()
+        for _ in range(n_sub):
+            c_gx, c_gy = spectral_gradients(c_salt_new, self.kx, self.ky)
+            Jx = -D_salt * c_gx
+            Jy = -D_salt * c_gy
+            div_J = spectral_divergence(Jx, Jy, self.kx, self.ky)
+            # Depletion at the plating front (Li+ consumed -> salt consumed)
+            source = -np.clip(c_salt_new, 0.0, 1.0) * deta_dt
+            c_salt_new = c_salt_new + dt_sub * (div_J + source)
+            # BCs: c_salt = 1 in the SE bulk (right boundary); arbitrary in Li metal.
+            c_salt_new = np.where(self.eta > 0.5, 0.0, c_salt_new)
+            c_salt_new[:, -1] = 1.0
+            c_salt_new = np.clip(c_salt_new, 0.0, 1.0)
+
+        return c_salt_new
+
+    # ------------------------------------------------------------------
+    def _update_sei_damage(self, sigma_h):
+        """Update the SEI damage field.
+
+        Damage accumulates when the local hydrostatic stress exceeds the
+        SEI yield stress (compressive or tensile — we use |sigma_h|).
+        Damage relaxes (heals) exponentially with rate sei_healing_rate.
+        High sei_damage locally enhances the Butler-Volmer source in
+        _butler_volmer_source(), producing the root-growth / whisker
+        morphology characteristic of Li dendrites.
+
+            d(damage)/dt = max(0, |sigma_h| - sigma_y_sei)/sigma_y_sei
+                            - sei_healing_rate * damage
+        """
+        sigma_h_safe = np.abs(sigma_h) if sigma_h is not None else np.zeros_like(self.eta)
+        # Damage rate: 0 if |sigma_h| < sigma_y_sei, grows linearly above.
+        overstress = np.maximum(
+            0.0, (sigma_h_safe - self.sei_yield_stress_Pa) /
+            max(self.sei_yield_stress_Pa, 1.0))
+        # Cap accumulation rate to 1/s to avoid runaway.
+        accum_rate = np.clip(overstress, 0.0, 1.0)
+        # Only accumulate in the SE region (the SEI lives at the Li/SE
+        # interface, which is the high-phi_gb band).
+        accum_rate = accum_rate * (0.5 + 0.5 * self.phi_gb)
+        d_damage = accum_rate - self.sei_healing_rate * self.sei_damage
+        self.sei_damage = np.clip(
+            self.sei_damage + self.dt * d_damage, 0.0, 1.0)
+        return self.sei_damage
 
     # ------------------------------------------------------------------
     def _evolve_phi_pot(self, deta_dt):
@@ -1852,11 +1997,17 @@ class LiSSBSolver:
         self._update_dynamic_grain_fields()
         deta_dt = (self.eta - eta_old) / self.dt
 
-        # 3. Update Li+ concentration
+        # 3. Update Li+ concentration (Nernst-Planck with transference number t+)
         self.c_li = self._evolve_c_li(deta_dt)
+
+        # 3b. Update salt (LiTFSI) concentration
+        self.c_salt = self._evolve_c_salt(deta_dt)
 
         # 4. Update electric potential
         self.phi_pot = self._evolve_phi_pot(deta_dt)
+
+        # 4b. Update SEI damage (root-growth / whisker mode driver)
+        self._update_sei_damage(sigma_h)
 
         # 5. Recompute effective transport properties (uses DYNAMIC phi_g)
         self.D_eff = self._compute_D_eff()
@@ -1893,6 +2044,10 @@ class LiSSBSolver:
         eta_bulk_mean = float(np.mean(self.eta[bulk_in_se])) if bulk_in_se.any() else 0.0
         c_li_gb_mean = float(np.mean(self.c_li[gb_in_se])) if gb_in_se.any() else 0.0
         c_li_bulk_mean = float(np.mean(self.c_li[bulk_in_se])) if bulk_in_se.any() else 0.0
+        c_salt_gb_mean = float(np.mean(self.c_salt[gb_in_se])) if gb_in_se.any() else 0.0
+        c_salt_bulk_mean = float(np.mean(self.c_salt[bulk_in_se])) if bulk_in_se.any() else 0.0
+        avg_sei_damage = float(np.mean(self.sei_damage))
+        max_sei_damage = float(np.max(self.sei_damage))
 
         # Li volume fraction
         li_vol_frac = float(np.mean(self.eta > 0.5))
@@ -1912,6 +2067,8 @@ class LiSSBSolver:
         self.history['eta_bulk_mean'].append(eta_bulk_mean)
         self.history['c_li_gb_mean'].append(c_li_gb_mean)
         self.history['c_li_bulk_mean'].append(c_li_bulk_mean)
+        self.history['c_salt_gb_mean'].append(c_salt_gb_mean)
+        self.history['c_salt_bulk_mean'].append(c_salt_bulk_mean)
         self.history['max_dendrite_depth_um'].append(dendrite_depth)
         self.history['li_volume_frac'].append(li_vol_frac)
         self.history['phi_min'].append(float(np.min(self.phi_pot)))
@@ -1921,11 +2078,14 @@ class LiSSBSolver:
         self.history['plastic_work'].append(
             float(np.sum(eps_p_mag) * self.dx * self.dy))
         self.history['energy'].append(total_energy)
+        self.history['avg_sei_damage'].append(avg_sei_damage)
+        self.history['max_sei_damage'].append(max_sei_damage)
 
         # Return snapshot for visualization
         return {
             'eta':         self.eta.copy(),
             'c_li':       self.c_li.copy(),
+            'c_salt':     self.c_salt.copy(),
             'c_e':        c_e,
             'phi_g':      self.phi_g.copy(),
             'grain_map':  self.grain_map.astype(float),
@@ -1939,6 +2099,7 @@ class LiSSBSolver:
             'sigma_y':    sigma_y.copy(),
             'rho_gnd':    rho_gnd,
             'phi_flux':   phi_flux_norm,
+            'sei_damage': self.sei_damage.copy(),
             'sxx':        sxx.copy(),
             'syy':        syy.copy(),
             'sxy':        sxy.copy(),
@@ -2171,6 +2332,7 @@ class LiSSBVisualizer:
         fields = [
             ('eta',        'eta (Li metal order parameter)', [0, 1]),
             ('c_li',      'c_Li+ (Li+ concentration)',     [0, 1]),
+            ('c_salt',    'c_salt (LiTFSI salt)',          [0, 1]),
             ('c_e',       'c_e- (electron concentration)', [0, 1]),
             ('grain_map', 'Voronoi grain map',              None),
             ('phi_g',     'phi_g (SE grain indicator)',     [0, 1]),
@@ -2184,6 +2346,7 @@ class LiSSBVisualizer:
             ('sigma_y',   'Yield stress (MPa)',             None),
             ('rho_gnd',   'rho_GND (GND density)',          [0, 1]),
             ('phi_flux',  '|J_Li+| (flux magnitude)',       [0, 1]),
+            ('sei_damage','SEI damage (0-1)',               [0, 1]),
         ]
         avail = [(f, t, r) for (f, t, r) in fields if f in results_dict]
         if not avail:
@@ -2725,9 +2888,10 @@ class DataExporter:
             x = np.linspace(extent[0], extent[1], Nx)
             y = np.linspace(extent[2], extent[3], Ny)
             X, Y = np.meshgrid(x, y)
-            keys = ('eta', 'c_li', 'c_e', 'phi_g', 'phi_gb', 'grain_map',
-                    'phi_pot', 'sigma_eq', 'sigma_h', 'sigma_y', 'h',
-                    'eps_p_mag', 'D_eff', 'rho_gnd', 'phi_flux')
+            keys = ('eta', 'c_li', 'c_salt', 'c_e', 'phi_g', 'phi_gb',
+                    'grain_map', 'phi_pot', 'sigma_eq', 'sigma_h', 'sigma_y',
+                    'h', 'eps_p_mag', 'D_eff', 'rho_gnd', 'phi_flux',
+                    'sei_damage')
             for i, frame in enumerate(history):
                 d = {'x': X.flatten(), 'y': Y.flatten()}
                 for k in keys:
@@ -2951,19 +3115,20 @@ def render_field_settings_panel(viz_cfg, key_prefix='fs'):
 
 
 def render_diagnostics_figure(solver, params, viz_cfg):
-    """Render the 4-panel diagnostics time-series figure."""
+    """Render the 6-panel diagnostics time-series figure."""
     fc = viz_cfg.get('figure_customization', {})
     fig_w = float(fc.get('diagnostics_width', 13.0))
-    fig_h = float(fc.get('diagnostics_height', 8.0))
+    fig_h = float(fc.get('diagnostics_height', 11.0))
     t_unit = get_time_unit_label(params)
     t = np.array(solver.history['time'])
 
     fig = plt.figure(figsize=(fig_w, fig_h))
-    gs = GridSpec(2, 2, figure=fig, height_ratios=[1, 1],
-                  hspace=0.35, wspace=0.30)
+    gs = GridSpec(3, 2, figure=fig, height_ratios=[1, 1, 1],
+                  hspace=0.45, wspace=0.30)
     axes = np.array([
         [fig.add_subplot(gs[0, 0]), fig.add_subplot(gs[0, 1])],
-        [fig.add_subplot(gs[1, 0]), fig.add_subplot(gs[1, 1])]
+        [fig.add_subplot(gs[1, 0]), fig.add_subplot(gs[1, 1])],
+        [fig.add_subplot(gs[2, 0]), fig.add_subplot(gs[2, 1])],
     ])
 
     c1 = fc.get('color_series_1', '#1f77b4')
@@ -3021,6 +3186,28 @@ def render_diagnostics_figure(solver, params, viz_cfg):
                         xlabel=t_xlabel, ylabel='sigma_eq (GPa)',
                         force_aspect='auto')
     apply_legend_styling(axes[1, 1], fc)
+
+    # Panel 5: SEI damage (root-growth / whisker mode driver)
+    axes[2, 0].plot(t, solver.history['avg_sei_damage'], color=c1,
+                     linestyle=ls_main, lw=lw_main, label='Avg SEI damage')
+    axes[2, 0].plot(t, solver.history['max_sei_damage'], color=c2,
+                     linestyle=ls_minor, lw=lw_minor, label='Max SEI damage')
+    apply_axis_styling(axes[2, 0], fc,
+                        title='SEI damage (root-growth driver)',
+                        xlabel=t_xlabel, ylabel='SEI damage (0-1)',
+                        force_aspect='auto')
+    apply_legend_styling(axes[2, 0], fc)
+
+    # Panel 6: salt concentration polarization (low t+ signature)
+    axes[2, 1].plot(t, solver.history['c_salt_gb_mean'], color=c1,
+                     linestyle=ls_main, lw=lw_main, label='c_salt at GBs')
+    axes[2, 1].plot(t, solver.history['c_salt_bulk_mean'], color=c2,
+                     linestyle=ls_main, lw=lw_main, label='c_salt in bulk')
+    apply_axis_styling(axes[2, 1], fc,
+                        title='Salt concentration polarization (low t+)',
+                        xlabel=t_xlabel, ylabel='mean c_salt',
+                        force_aspect='auto')
+    apply_legend_styling(axes[2, 1], fc)
 
     st.pyplot(fig)
     plt.close(fig)
@@ -3150,20 +3337,66 @@ def main():
                      "PPC: amorphous, excellent RT mobility. "
                      "PVDF: high mechanical stiffness suppresses dendrites. "
                      "custom: user-configurable D_bulk and D_gb ratio.")
-            if se_material == 'custom':
-                custom_D_bulk = st.slider(
-                    "D_bulk (m^2/s)", 1.0e-14, 1.0e-10, 5.0e-13,
-                    format="%.2e", key="custom_D_bulk")
-                custom_D_gb_ratio = st.slider(
-                    "D_gb / D_bulk ratio", 10.0, 1.0e4, 200.0,
-                    format="%.0f", key="custom_D_gb_ratio")
-                custom_sigma_SE = st.slider(
-                    "sigma_SE (S/m)", 1.0e-6, 1.0e-1, 1.0e-4,
-                    format="%.2e", key="custom_sigma_SE")
-            else:
-                custom_D_bulk = 5.0e-13
-                custom_D_gb_ratio = 200.0
-                custom_sigma_SE = 1.0e-4
+
+            # Look up the default transport properties for the chosen
+            # material so the sliders below can default to the right
+            # values when the user switches between PEO/PAN/PPC/PVDF.
+            se_defaults_map = {
+                'PEO_Li': {'D_bulk': 5.0e-13,  'D_gb_ratio': 200.0, 'sigma_SE': 1.0e-4},
+                'PAN':    {'D_bulk': 2.0e-12,  'D_gb_ratio': 300.0, 'sigma_SE': 5.0e-4},
+                'PPC':    {'D_bulk': 1.0e-11,  'D_gb_ratio': 100.0, 'sigma_SE': 1.5e-4},
+                'PVDF':   {'D_bulk': 8.0e-13,  'D_gb_ratio': 400.0, 'sigma_SE': 2.0e-4},
+                'custom': {'D_bulk': 5.0e-13,  'D_gb_ratio': 200.0, 'sigma_SE': 1.0e-4},
+            }
+            se_def = se_defaults_map.get(se_material, se_defaults_map['PEO_Li'])
+
+            # --- Always-on SE transport sliders (defaults from chosen material) ---
+            # The user explicitly requested that D_bulk and D_gb_ratio be
+            # adjustable for ALL SE materials (not just 'custom').  The
+            # slider defaults update when the user switches materials.
+            custom_D_bulk = st.slider(
+                "D_bulk (intrgrain, m^2/s)", 1.0e-14, 1.0e-10,
+                float(se_def['D_bulk']),
+                format="%.2e", key="custom_D_bulk",
+                help="Intragranular Li+ diffusivity in the polymer SE. "
+                     "Defaults: PEO_Li=5e-13, PAN=2e-12, PPC=1e-11, "
+                     "PVDF=8e-13 m^2/s.")
+            custom_D_gb_ratio = st.slider(
+                "D_gb / D_bulk ratio", 10.0, 1.0e4,
+                float(se_def['D_gb_ratio']),
+                format="%.0f", key="custom_D_gb_ratio",
+                help="Grain-boundary enhancement factor.  Higher = more "
+                     "preferential dendrite propagation along GBs. "
+                     "Defaults: PEO_Li=200, PAN=300, PPC=100, PVDF=400.")
+            custom_sigma_SE = st.slider(
+                "sigma_SE (S/m)", 1.0e-6, 1.0e-1,
+                float(se_def['sigma_SE']),
+                format="%.2e", key="custom_sigma_SE",
+                help="Ionic conductivity of the polymer SE.  Defaults: "
+                     "PEO_Li=1e-4, PAN=5e-4, PPC=1.5e-4, PVDF=2e-4 S/m.")
+
+            # --- NEW PHYSICS: transference number, SEI damage ---
+            st.subheader("Li-specific transport & SEI")
+            transference_number = st.slider(
+                "Transference number t+ (Li+)", 0.05, 0.95, 0.30, 0.01,
+                key="transference_number",
+                help="Li+ transference number in the polymer SE.  PEO/LiTFSI: "
+                     "~0.2-0.4 (low — anions carry most of the current, "
+                     "causing severe concentration polarization).  "
+                     "PAN/PPC/PVDF: ~0.5-0.7.  Low t+ is the primary driver "
+                     "of Li dendrite growth in real cells.")
+            sei_yield_stress_MPa = st.slider(
+                "SEI yield stress (MPa)", 1.0, 500.0, 50.0, 1.0,
+                key="sei_yield_stress_MPa",
+                help="Hydrostatic stress at which the SEI starts to "
+                     "accumulate damage (crack).  Typical Li-SEI: "
+                     "10-100 MPa.  Lower = easier cracking = more "
+                     "root-growth / whisker mode dendrites.")
+            sei_healing_rate = st.slider(
+                "SEI healing rate (1/s)", 1.0e-6, 1.0e-2, 1.0e-4,
+                format="%.1e", key="sei_healing_rate",
+                help="Exponential relaxation rate of SEI damage.  Lower = "
+                     "damage persists longer = more whisker growth.")
 
             st.subheader("Operating temperature")
             temperature_C = st.slider(
@@ -3210,9 +3443,18 @@ def main():
                                      "from 1e-3 to 5e-3 to drive visible "
                                      "dendrite growth.")
             kappa = st.slider("kappa (gradient energy)", 1.0e-16, 1.0e-13,
-                                1.0e-15, format="%.2e")
+                                2.0e-15, format="%.2e",
+                                help="Gradient energy coefficient.  Li has "
+                                     "a higher surface energy than Na, so "
+                                     "the default is 2e-15 (vs the original "
+                                     "Na value of 1e-15).  Higher = flatter "
+                                     "interfaces.")
             w_barrier = st.slider("w (barrier height)", 1.0e5, 1.0e7,
-                                    1.0e6, format="%.2e")
+                                    2.0e6, format="%.2e",
+                                    help="Double-well barrier height.  Li "
+                                         "has a higher surface energy than "
+                                         "Na, so the default is 2e6 (vs "
+                                         "the original Na value of 1e6).")
             alpha_bv = st.slider("alpha (BV symmetry)", 0.1, 0.9, 0.5, 0.05)
             aniso_str = st.slider("Anisotropy strength", 0.0, 0.5, 0.0, 0.02)
 
@@ -3249,6 +3491,9 @@ def main():
                 'custom_D_bulk': custom_D_bulk,
                 'custom_D_gb_ratio': custom_D_gb_ratio,
                 'custom_sigma_SE': custom_sigma_SE,
+                'transference_number': transference_number,
+                'sei_yield_stress_MPa': sei_yield_stress_MPa,
+                'sei_healing_rate': sei_healing_rate,
                 'temperature_K': temperature_K,
                 'temperature_C': temperature_C,
                 'L_eta': L_eta, 'L_phi': L_phi, 'kappa': kappa,
@@ -3417,6 +3662,15 @@ def main():
                     f"- D_bulk = `{D_bulk_disp:.2e}` m^2/s, "
                     f"D_gb = `{D_gb_disp:.2e}` m^2/s "
                     f"(ratio = {D_gb_disp/D_bulk_disp:.0f}x)\n"
+                    f"- Transference number t+ = "
+                    f"`{solver_init.transference_number:.2f}` "
+                    f"(low t+ -> concentration polarization)\n"
+                    f"- SEI yield stress = "
+                    f"`{solver_init.sei_yield_stress_Pa/1e6:.1f} MPa`, "
+                    f"healing rate = "
+                    f"`{solver_init.sei_healing_rate:.1e} 1/s`\n"
+                    f"- D_Li (metal self-diffusion) = "
+                    f"`{solver_init.D_Li:.2e}` m^2/s\n"
                     f"- Operating temperature = "
                     f"`{params.get('temperature_C', 60.0):.1f} C` "
                     f"(`{params.get('temperature_K', 333.15):.2f} K`)\n"
